@@ -1,12 +1,9 @@
 import tensorflow as tf
 from tensorflow.keras.layers import Conv1D, MaxPooling1D, Dropout, Flatten, Dense
 from tensorflow.keras.models import Sequential
-from sklearn.model_selection import train_test_split
 import numpy as np
 import pandas as pd
-from Bio import SeqIO, Entrez
-from Bio.Seq import Seq
-from io import StringIO  # For GFF3 to GTF conversion if needed
+from Bio import SeqIO
 
 def gff3_to_gtf(gff3_path, output_path):
     """Convert GFF3 to GTF format (basic)."""
@@ -42,6 +39,10 @@ class SequenceLoader:
 
     def extract_sequences(self, tpm_df):
         """Extract flanking sequences and binary labels (low=0, high=1)."""
+        # Validate input
+        if 'logMaxTPM' not in tpm_df.columns:
+            raise ValueError("tpm_df must contain 'logMaxTPM' column")
+        
         genes = self.gtf[self.gtf['feature'] == 'gene'].dropna(subset=['gene_id'])
         genes = genes[genes['gene_id'].isin(tpm_df.index)]
 
@@ -52,38 +53,61 @@ class SequenceLoader:
             chr_name = row['chr']
             if chr_name not in self.genome:
                 continue  # Skip missing chr
+            
+            # Check if gene_id exists in tpm_df
+            if row['gene_id'] not in tpm_df.index:
+                continue  # Skip missing genes
+            
             seq = self.genome[chr_name]
             start, end, strand = int(row['start']), int(row['end']), row['strand']
+            seq_len = len(seq)
 
             # TSS/TTS based on strand
             tss = start if strand == '+' else end
             tts = end if strand == '+' else start
 
-            # Extract regions (paper: 1kb up/down + 0.5kb UTRs)
+            # Extract regions with bounds checking (paper: 1kb up/down + 0.5kb UTRs)
             if strand == '+':
-                promoter = seq[max(0, tss-1001):tss-1]
-                utr5 = seq[tss-1:tss+499]
-                utr3 = seq[tts-500:tts]
-                terminator = seq[tts:tts+1000]
+                promoter = seq[max(0, tss-1001):max(0, tss-1)]
+                utr5 = seq[max(0, tss-1):min(seq_len, tss+499)]
+                utr3 = seq[max(0, tts-500):min(seq_len, tts)]
+                terminator = seq[min(seq_len, tts):min(seq_len, tts+1000)]
             else:
+                # Proper reverse complement handling
                 rev_seq = seq.reverse_complement()
-                promoter = rev_seq[end:end+1000]  # Adjust for RC
-                utr5 = rev_seq[end-499:end]
-                utr3 = rev_seq[start:start+500]
-                terminator = rev_seq[start-1001:start-1]
+                rev_start = seq_len - end
+                rev_end = seq_len - start
+                rev_tss = rev_start
+                rev_tts = rev_end
+                
+                promoter = rev_seq[max(0, rev_tss-1001):max(0, rev_tss-1)]
+                utr5 = rev_seq[max(0, rev_tss-1):min(seq_len, rev_tss+499)]
+                utr3 = rev_seq[max(0, rev_tts-500):min(seq_len, rev_tts)]
+                terminator = rev_seq[min(seq_len, rev_tts):min(seq_len, rev_tts+1000)]
 
             full_seq = (str(promoter) + str(utr5) + 'N'*20 + str(utr3) + str(terminator))
             encoded = one_hot_encode(full_seq)
-            if len(encoded) < 3000:  # Pad if short
+            
+            # Truncate if too long, pad if too short
+            if len(encoded) > 3000:
+                encoded = encoded[:3000]
+            elif len(encoded) < 3000:
                 encoded = np.pad(encoded, ((0, 3000 - len(encoded)), (0,0)), 'constant')
 
-            logtpm = tpm_df.loc[row['gene_id'], 'logMaxTPM']
+            try:
+                logtpm = tpm_df.loc[row['gene_id'], 'logMaxTPM']
+            except KeyError:
+                continue  # Skip if gene not in tpm_df
+            
             label = 0 if logtpm <= q25 else (1 if logtpm > q75 else -1)
             if label != -1:
-                sequences.append(encoded[:3000])  # Fixed length
+                sequences.append(encoded)
                 labels.append(label)
                 ids.append(row['gene_id'])
 
+        if len(sequences) == 0:
+            raise ValueError("No valid sequences extracted. Check data compatibility.")
+        
         return np.array(sequences), np.array(labels), ids
 
 def build_cnn(input_shape=(3000, 4)):

@@ -2,5 +2,6 @@ tensorflow==2.12.0
 numpy
 pandas
 biopython
-deeplift
+shap
 scikit-learn
+matplotlib

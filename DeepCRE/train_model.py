@@ -1,4 +1,5 @@
 import os
+import tensorflow as tf
 from utils import SequenceLoader, build_cnn
 import numpy as np
 import pandas as pd
@@ -13,13 +14,32 @@ loader = SequenceLoader('data/genome.fasta', 'data/genes.gtf')
 X, y, ids = loader.extract_sequences(tpm_df)
 
 # Chromosomal CV (adapt chromosomes, e.g., A01-D13 for cotton)
-chromosomes = sorted(set(loader.gtf['chr']))  # Auto-detect
-kf = KFold(n_splits=min(5, len(chromosomes)), shuffle=True)  # 5-fold or #chrs
+# Map each gene to its chromosome
+gene_to_chr = {}
+for gene_id in ids:
+    gene_rows = loader.gtf[loader.gtf['gene_id'] == gene_id]
+    if len(gene_rows) > 0:
+        gene_to_chr[gene_id] = gene_rows.iloc[0]['chr']
+    else:
+        gene_to_chr[gene_id] = 'unknown'
+
+chr_list = [gene_to_chr.get(gid, 'unknown') for gid in ids]
+unique_chrs = sorted(set(chr_list))
+
+# Split by chromosomes, not by samples
+kf = KFold(n_splits=min(5, len(unique_chrs)), shuffle=True, random_state=42)
 results = []
 
-for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
-    X_train, X_val = X[train_idx], X[val_idx]
-    y_train, y_val = y[train_idx], y[val_idx]
+for fold, (train_chr_idx, val_chr_idx) in enumerate(kf.split(unique_chrs)):
+    train_chrs = set([unique_chrs[i] for i in train_chr_idx])
+    val_chrs = set([unique_chrs[i] for i in val_chr_idx])
+    
+    # Create masks based on chromosome membership
+    train_mask = np.array([chr_list[i] in train_chrs for i in range(len(X))])
+    val_mask = np.array([chr_list[i] in val_chrs for i in range(len(X))])
+    
+    X_train, X_val = X[train_mask], X[val_mask]
+    y_train, y_val = y[train_mask], y[val_mask]
 
     # Normal model
     model = build_cnn()
@@ -43,6 +63,14 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
 pd.DataFrame(results).to_csv('results/training_results.csv', index=False)
 print(pd.DataFrame(results).groupby('type')[['acc', 'auroc']].mean())
 
-# Save best model (aggregate)
-best_model = tf.keras.models.load_model('models/cotton_fold0.h5')  # Or ensemble
-best_model.save('models/best_cotton_model.h5')
+# Save best model (select fold with best AUROC)
+normal_results = [r for r in results if r['type'] == 'normal']
+if normal_results:
+    best_fold = max(normal_results, key=lambda x: x['auroc'])['fold']
+    best_model = tf.keras.models.load_model(f'models/cotton_fold{best_fold}.h5')
+    best_model.save('models/best_cotton_model.h5')
+    print(f"Best model saved from fold {best_fold} with AUROC: {max(normal_results, key=lambda x: x['auroc'])['auroc']:.4f}")
+else:
+    print("Warning: No normal model results found. Using fold 0 as default.")
+    best_model = tf.keras.models.load_model('models/cotton_fold0.h5')
+    best_model.save('models/best_cotton_model.h5')
